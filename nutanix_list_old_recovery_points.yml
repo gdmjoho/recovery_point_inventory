@@ -1,0 +1,99 @@
+#code: ansible
+---
+- name: "Nutanix: List Recovery Points older than N days"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars/nutanix_info.yml
+    - vars/secrets.yml
+  vars:
+    recovery_point_max_age_days: 
+    recovery_point_page_size: 500
+    recovery_point_request_timeout: 90
+    recovery_point_request_retries: 3
+    recovery_point_request_retry_delay: 2
+    recovery_point_csv_path: "reports/old_recovery_points.csv"
+    recovery_point_parallel_workers: 24
+    recovery_point_enrichment_retry_attempts: 2
+    recovery_point_enrichment_retry_backoff_seconds: 0.2
+    rp_list_url: "https://{{ pc_ip }}:9440/api/nutanix/v3/vm_recovery_points/list"
+    rp_uri_defaults: &rp_uri_defaults
+      method: POST
+      user: "{{ vault_pc_username }}"
+      password: "{{ vault_pc_password }}"
+      force_basic_auth: true
+      validate_certs: false
+      return_content: true
+      body_format: json
+      headers:
+        Content-Type: "application/json"
+        Accept: "application/json"
+  tasks:
+    - name: "Fetch first page (count probe)"
+      ansible.builtin.uri:
+        <<: *rp_uri_defaults
+        url: "{{ rp_list_url }}"
+        body: { kind: vm_recovery_point, length: 1, offset: 0 }
+        status_code: 200
+      register: vm_recovery_points_first
+
+    - name: "Fetch all recovery point pages"
+      ansible.builtin.uri:
+        <<: *rp_uri_defaults
+        url: "{{ rp_list_url }}"
+        body:
+          kind: vm_recovery_point
+          length: "{{ recovery_point_page_size | int }}"
+          offset: "{{ item | int }}"
+          sort_attribute: creation_time
+          sort_order: ASCENDING
+        timeout: "{{ recovery_point_request_timeout | int }}"
+      failed_when: false
+      changed_when: false
+      until: vm_recovery_points_pages.status | default(-1) == 200
+      retries: "{{ recovery_point_request_retries | int }}"
+      delay: "{{ recovery_point_request_retry_delay | int }}"
+      loop: "{{ range(0, vm_recovery_points_first.json.metadata.total_matches | default(0) | int, recovery_point_page_size | int) | list }}"
+      loop_control: { label: "offset={{ item }}" }
+      register: vm_recovery_points_pages
+
+    - name: "Collect raw entities and failed offsets"
+      ansible.builtin.set_fact:
+        recovery_points_raw: "{{ vm_recovery_points_pages.results | selectattr('status', 'equalto', 200) | map(attribute='json.entities') | list | flatten }}"
+        vm_recovery_points_failed_offsets: "{{ vm_recovery_points_pages.results | rejectattr('status', 'equalto', 200) | map(attribute='item') | list }}"
+
+    - name: "Run recovery point pipeline script"
+      ansible.builtin.command:
+        argv: [python3, scripts/nutanix_recovery_points_pipeline.py]
+      args:
+        stdin: >-
+          {{ {
+            'recovery_points_raw': recovery_points_raw,
+            'cutoff_epoch': ((now(utc=true).strftime('%s') | int) - (recovery_point_max_age_days | int * 86400)),
+            'now_epoch': (now(utc=true).strftime('%s') | int),
+            'pc_ip': pc_ip,
+            'username': vault_pc_username,
+            'password': vault_pc_password,
+            'timeout': (recovery_point_request_timeout | int),
+            'max_workers': (recovery_point_parallel_workers | int),
+            'retry_attempts': (recovery_point_enrichment_retry_attempts | int),
+            'retry_backoff_seconds': (recovery_point_enrichment_retry_backoff_seconds | float),
+            'validate_certs': false,
+            'csv_path': recovery_point_csv_path
+          } | to_json }}
+      register: recovery_point_pipeline_result
+      changed_when: false
+      no_log: true
+
+    - name: "Expose pipeline results"
+      ansible.builtin.set_fact:
+        rp_data: "{{ recovery_point_pipeline_result.stdout | from_json }}"
+        old_recovery_points_human: "{{ (recovery_point_pipeline_result.stdout | from_json).old_recovery_points_human }}"
+
+    - name: "Show CSV export summary"
+      ansible.builtin.debug:
+        msg:
+          - "CSV written: {{ rp_data.csv_path }}"
+          - "Rows written: {{ old_recovery_points_human | length }}"
+          - "Rows with missing VM: {{ old_recovery_points_human | selectattr('vm_exists', 'equalto', 'no') | list | length }}"
+          - "Rows with known snapshot size: {{ old_recovery_points_human | rejectattr('snapshot_size_gib', 'equalto', 'unknown') | list | length }}"
